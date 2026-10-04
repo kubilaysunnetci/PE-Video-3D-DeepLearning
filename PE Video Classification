@@ -1,0 +1,235 @@
+clc;
+clear;
+close all;
+
+%% =========================================================================
+% 0. GPU & ENVIRONMENT SETUP
+% =========================================================================
+setenv('MW_CUDA_FORWARD_COMPATIBILITY', '1');
+try
+    parallel.gpu.enableCUDAForwardCompatibility(true);
+    myGPU = gpuDevice(1);
+    fprintf('GPU Successfully Activated: %s\n', myGPU.Name);
+catch ME
+    warning('GPU initialization failed: %s', ME.message);
+end
+
+%% =========================================================================
+% 1. DATASET SETUP & PARAMETERS
+% =========================================================================
+% Input dimensions: [Height, Width, Channels, Frames/TimeSteps]
+inputSize = [60 60 3 30]; 
+
+datasetType = 'NCCT' or 'CTPA';
+
+% Model Selector: 'PureStream-3D' | 'BiLSTM-ResNet-3D' | 'AttnFocus-3D'
+modelType = 'AttnFocus-3D'; 
+
+% -------------------------------------------------------------------------
+% % Note: Dataset loading and pre-processing pipeline (CT Angiography / Video)
+% % Placeholders for XTrain, YTrain, XVal, YVal, XTest, YTest variables.
+% -------------------------------------------------------------------------
+% Dummy data instantiation for testing script logic execution:
+% XTrain = rand(60,60,3,30, 70, 'single'); YTrain = categorical(randi([1 2],70,1));
+% XVal   = rand(60,60,3,30, 20, 'single'); YVal   = categorical(randi([1 2],20,1));
+% XTest  = rand(60,60,3,30, 10, 'single'); YTest  = categorical(randi([1 2],10,1));
+
+numClasses = numel(categories(YTrain));
+uClasses = unique(YTrain); 
+classWeights = [1.0, 1.0] or [1.0 2.0]; 
+
+fprintf('Selected Model Architecture: %s\n', modelType);
+
+%% =========================================================================
+% 2. ARCHITECTURE DEFINITIONS
+% =========================================================================
+lgraph = layerGraph();
+
+switch modelType
+    case 'PureStream-3D'
+        % =================================================================
+        % MODEL 1: PureStream-3D (Baseline 3D CNN)
+        % =================================================================
+        layers = [
+            image3dInputLayer(inputSize, 'Name', 'input', 'Normalization', 'none')
+            
+            convolution3dLayer([3 3 3], 16, 'Padding', 'same', 'Name', 'conv1')
+            batchNormalizationLayer('Name', 'bn1')
+            reluLayer('Name', 'relu1')
+            maxPooling3dLayer([2 2 2], 'Stride', [2 2 2], 'Name', 'pool1')
+            
+            convolution3dLayer([3 3 3], 32, 'Padding', 'same', 'Name', 'conv2')
+            batchNormalizationLayer('Name', 'bn2')
+            reluLayer('Name', 'relu2')
+            
+            convolution3dLayer([3 3 3], 64, 'Stride', [2 2 2], 'Padding', 'same', 'Name', 'conv3')
+            batchNormalizationLayer('Name', 'bn3')
+            reluLayer('Name', 'relu3')
+            
+            globalAveragePooling3dLayer('Name', 'gap')
+            
+            fullyConnectedLayer(32, 'Name', 'fc1')
+            reluLayer('Name', 'relu_fc1')
+            dropoutLayer(0.5, 'Name', 'drop1')
+            fullyConnectedLayer(numClasses, 'Name', 'fc_out')
+            softmaxLayer('Name', 'softmax')
+            classificationLayer('Classes', uClasses, 'ClassWeights', classWeights, 'Name', 'classOutput')
+        ];
+        lgraph = addLayers(lgraph, layers);
+
+    case 'BiLSTM-ResNet-3D'
+        % =================================================================
+        % MODEL 2: BiLSTM-ResNet-3D (Spatio-Temporal Residual + Bi-LSTM)
+        % =================================================================
+        mainLayers = [
+            image3dInputLayer(inputSize, 'Name', 'input', 'Normalization', 'none')
+            
+            convolution3dLayer([3 3 1], 32, 'Padding', 'same', 'Name', 'root_spatial')
+            batchNormalizationLayer('Name', 'bn_root_s')
+            reluLayer('Name', 'relu_root_s')
+            
+            convolution3dLayer([1 1 3], 32, 'Padding', 'same', 'Name', 'root_temporal')
+            batchNormalizationLayer('Name', 'bn_root_t')
+            reluLayer('Name', 'relu_root_t')
+            
+            maxPooling3dLayer([2 2 1], 'Stride', [2 2 1], 'Name', 'maxpool_root')
+        ];
+
+        resnetBlockLayers = [
+            convolution3dLayer([3 3 1], 32, 'Padding', 'same', 'Name', 'res_spatial1')
+            batchNormalizationLayer('Name', 'bn_res_s1')
+            reluLayer('Name', 'relu_res_s1')
+            
+            convolution3dLayer([1 1 3], 32, 'Padding', 'same', 'Name', 'res_temporal1')
+            batchNormalizationLayer('Name', 'bn_res_t1')
+            reluLayer('Name', 'relu_res_t1')
+            
+            convolution3dLayer(3, 32, 'Padding', 'same', 'Name', 'res_3d_conv2')
+            batchNormalizationLayer('Name', 'bn_res_3d_2')
+        ];
+
+        outputLayers = [
+            additionLayer(2, 'Name', 'res_add') 
+            reluLayer('Name', 'relu_res_out')
+            
+            convolution3dLayer(3, 64, 'Padding', 'same', 'Name', 'final_3d_conv')
+            batchNormalizationLayer('Name', 'bn_final')
+            reluLayer('Name', 'relu_final')
+            maxPooling3dLayer([2 2 2], 'Stride', [2 2 2], 'Name', 'maxpool_final') 
+            
+            globalAveragePooling3dLayer('Name', 'spatial_collapse')
+            flattenLayer('Name', 'flatten')
+            
+            bilstmLayer(32, 'OutputMode', 'last', 'Name', 'bilstm_temporal')
+            
+            dropoutLayer(0.5, 'Name', 'drop')
+            fullyConnectedLayer(numClasses, 'Name', 'fc')
+            softmaxLayer('Name', 'softmax')
+            classificationLayer('Classes', uClasses, 'ClassWeights', classWeights, 'Name', 'classOutput')
+        ];
+
+        lgraph = addLayers(lgraph, mainLayers);
+        lgraph = addLayers(lgraph, resnetBlockLayers);
+        lgraph = addLayers(lgraph, outputLayers);
+
+        lgraph = connectLayers(lgraph, 'maxpool_root', 'res_spatial1');
+        lgraph = connectLayers(lgraph, 'bn_res_3d_2', 'res_add/in1');
+        lgraph = connectLayers(lgraph, 'maxpool_root', 'res_add/in2');
+
+    case 'AttnFocus-3D'
+        % =================================================================
+        % MODEL 3: AttnFocus-3D (Multi-Scale 3D Conv + Self-Attention)
+        % =================================================================
+        lgraph = addLayers(lgraph, image3dInputLayer(inputSize, 'Name', 'input', 'Normalization', 'none'));
+        lgraph = addLayers(lgraph, convolution3dLayer([3 3 3], 32, 'Padding', 'same', 'Name', 'conv1'));
+        lgraph = addLayers(lgraph, batchNormalizationLayer('Name', 'bn1'));
+        lgraph = addLayers(lgraph, reluLayer('Name', 'relu1'));
+        lgraph = addLayers(lgraph, maxPooling3dLayer([2 2 2], 'Stride', [2 2 2], 'Name', 'pool1'));
+
+        lgraph = addLayers(lgraph, convolution3dLayer([3 3 3], 64, 'Padding', 'same', 'Name', 'scale1_conv'));
+        lgraph = addLayers(lgraph, batchNormalizationLayer('Name', 'scale1_bn'));
+        lgraph = addLayers(lgraph, reluLayer('Name', 'scale1_relu'));
+
+        lgraph = addLayers(lgraph, convolution3dLayer([5 5 5], 64, 'Padding', 'same', 'Name', 'scale2_conv'));
+        lgraph = addLayers(lgraph, batchNormalizationLayer('Name', 'scale2_bn'));
+        lgraph = addLayers(lgraph, reluLayer('Name', 'scale2_relu'));
+
+        lgraph = addLayers(lgraph, concatenationLayer(4, 2, 'Name', 'concat_scales'));
+        lgraph = addLayers(lgraph, convolution3dLayer([1 1 1], 64, 'Name', 'reduction_conv'));
+        lgraph = addLayers(lgraph, globalAveragePooling3dLayer('Name', 'gap'));
+        lgraph = addLayers(lgraph, flattenLayer('Name', 'flatten'));
+
+        lgraph = addLayers(lgraph, selfAttentionLayer(8, 64, 'Name', 'attn1'));
+        lgraph = addLayers(lgraph, layerNormalizationLayer('Name', 'ln1'));
+        lgraph = addLayers(lgraph, dropoutLayer(0.5, 'Name', 'drop1'));
+        lgraph = addLayers(lgraph, fullyConnectedLayer(64, 'Name', 'fc1'));
+        lgraph = addLayers(lgraph, reluLayer('Name', 'relu_fc1'));
+        lgraph = addLayers(lgraph, fullyConnectedLayer(numClasses, 'Name', 'fc_out'));
+        lgraph = addLayers(lgraph, softmaxLayer('Name', 'softmax'));
+        lgraph = addLayers(lgraph, classificationLayer('Classes', uClasses, 'ClassWeights', classWeights, 'Name', 'classOutput'));
+
+        lgraph = connectLayers(lgraph, 'input', 'conv1');
+        lgraph = connectLayers(lgraph, 'conv1', 'bn1');
+        lgraph = connectLayers(lgraph, 'bn1', 'relu1');
+        lgraph = connectLayers(lgraph, 'relu1', 'pool1');
+
+        lgraph = connectLayers(lgraph, 'pool1', 'scale1_conv');
+        lgraph = connectLayers(lgraph, 'pool1', 'scale2_conv');
+
+        lgraph = connectLayers(lgraph, 'scale1_conv', 'scale1_bn');
+        lgraph = connectLayers(lgraph, 'scale1_bn', 'scale1_relu');
+        lgraph = connectLayers(lgraph, 'scale2_conv', 'scale2_bn');
+        lgraph = connectLayers(lgraph, 'scale2_bn', 'scale2_relu');
+
+        lgraph = connectLayers(lgraph, 'scale1_relu', 'concat_scales/in1');
+        lgraph = connectLayers(lgraph, 'scale2_relu', 'concat_scales/in2');
+        lgraph = connectLayers(lgraph, 'concat_scales', 'reduction_conv');
+        lgraph = connectLayers(lgraph, 'reduction_conv', 'gap');
+        lgraph = connectLayers(lgraph, 'gap', 'flatten');
+        lgraph = connectLayers(lgraph, 'flatten', 'attn1');
+        lgraph = connectLayers(lgraph, 'attn1', 'ln1');
+        lgraph = connectLayers(lgraph, 'ln1', 'drop1');
+        lgraph = connectLayers(lgraph, 'drop1', 'fc1');
+        lgraph = connectLayers(lgraph, 'fc1', 'relu_fc1');
+        lgraph = connectLayers(lgraph, 'relu_fc1', 'fc_out');
+        lgraph = connectLayers(lgraph, 'fc_out', 'softmax');
+        lgraph = connectLayers(lgraph, 'softmax', 'classOutput');
+
+    otherwise
+        error('Invalid model architecture specified.');
+end
+
+%% =========================================================================
+% 3. TRAINING OPTIONS
+% =========================================================================
+options = trainingOptions('adam', ...
+    'InitialLearnRate', 5e-5, ... 
+    'MaxEpochs', 50 or 75, ...                 
+    'MiniBatchSize', 8, ... 
+    'ValidationData', {XVal, YVal}, ... 
+    'ValidationFrequency', 50, ... 
+    'OutputNetwork', 'best-validation', ...
+    'Shuffle', 'every-epoch', ...
+    'Plots', 'none', ...                 
+    'ExecutionEnvironment', 'gpu', ...  
+    'Verbose', true);
+
+% Train the active network architecture
+[net, info] = trainNetwork(XTrain, YTrain, lgraph, options);
+
+%% =========================================================================
+% 4. EVALUATION & METRICS METRICS (VALIDATION & TEST SETS)
+% =========================================================================
+classNames = categories(YTrain);
+
+% --- 4.1 VALIDATION SET ---
+[YPredVal, scoresVal] = classify(net, XVal);
+
+figure('Name', sprintf('%s - Validation Confusion Matrix', modelType), 'Position', [100 200 550 450]);
+confusionchart(YVal, YPredVal, 'Title', sprintf('%s - Validation Matrix', modelType));
+
+% --- 4.2 TEST SET ---
+[YPredTest, scoresTest] = classify(net, XTest);
+
+figure('Name', sprintf('%s - Test Confusion Matrix', modelType), 'Position', [700 200 550 450]);
+confusionchart(YTest, YPredTest, 'Title', sprintf('%s - Test Matrix', modelType));
